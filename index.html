@@ -31,6 +31,8 @@
 :root{color-scheme:dark;box-sizing:border-box;padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) env(safe-area-inset-bottom,0px) env(safe-area-inset-left,0px)}
 html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
 #screen{position:absolute;display:block;image-rendering:pixelated;image-rendering:crisp-edges;cursor:none;outline:none;background:#000}
+html.jj-swipe-fixed #screen,html.jj-swipe-fixed [data-jj]:not([data-jj=swipe-spacer]){position:fixed!important}
+html.jj-swipe-scroll{overflow-y:auto!important;touch-action:pan-y!important}html.jj-swipe-scroll body{overflow:visible!important;touch-action:pan-y!important}
 </style>
 </head>
 <body>
@@ -880,13 +882,14 @@ const IN = {
     }, { passive: false });
     canvas.addEventListener('touchmove', e => { const t = e.changedTouches[0]; pos(t.clientX, t.clientY); this.last = 'touch'; if (e.cancelable) e.preventDefault(); }, { passive: false });
     canvas.addEventListener('touchend', e => {
-      this.mdown = false; this.last = 'touch'; AUDIO.unlock(); _tryFullscreen(); _wakeLock(); // touchEND is the user activation (iOS + Chrome)
+      // touchEND is the user activation (iOS + Chrome): fullscreen (Android / iPad), the one-time iPhone card, wake lock
+      this.mdown = false; this.last = 'touch'; AUDIO.unlock(); _fsActivation(true); _wakeLock();
       if (e.cancelable) e.preventDefault();
     }, { passive: false });
     // a system touchcancel (notification shade, palm, call) is a lift OFF the canvas: never a deliberate tap or bet
     canvas.addEventListener('touchcancel', () => { this.mx = -1; this.my = -1; this.mdown = false; }, { passive: false });
-    canvas.addEventListener('mousedown', () => _wakeLock());
-    window.addEventListener('keydown', () => _wakeLock());
+    canvas.addEventListener('mousedown', () => { _wakeLock(); _fsActivation(false); });
+    window.addEventListener('keydown', () => { _wakeLock(); _fsActivation(false); });
     document.addEventListener('visibilitychange', () => { if (!document.hidden && _WL.asked) { _WL.lock = null; _wakeLock(); } });
     // no pinch / double-tap zoom or long-press callouts anywhere on the page
     document.addEventListener('gesturestart', e => e.preventDefault(), { passive: false });
@@ -1772,7 +1775,51 @@ Scenes.define('preview', {
 });
 
 // ------------------------------------------------------------------ display (integer-scaled, crisp)
-const DISPLAY = { canvas: null, ctx: null, off: null, octx: null, img: null, u32: null, scale: 1, dpr: 1 };
+const DISPLAY = {
+  canvas: null, ctx: null, off: null, octx: null, img: null, u32: null, scale: 1, dpr: 1, rotated: false, geo: null, relayout: null,
+  /** Full screen on this device: 'on' (fullscreen now, or running as a Home Screen web app), 'native' (the Fullscreen API works:
+   *  Android, iPad, touch laptops), 'ios-home' (iPhone: there is no API; the only true fullscreen is Add to Home Screen),
+   *  'none' (mouse + keyboard desktop, inside an iframe, headless). */
+  fsMode() { return _fsMode(); },
+  /** For a FULL SCREEN menu item. 'native': asks at once inside a user activation (a key press, the end of a tap; pass
+   *  inGesture = true from a DOM touchend/click handler), else at the end of the current tap / the next key press (a tick that
+   *  follows a touchSTART has no activation: RM-01); 'ios-home': opens the Add to Home Screen card. Returns fsMode(). */
+  fullscreen(inGesture) {
+    const m = _fsMode();
+    if (m === 'ios-home') _fsCardOpen();
+    else if (m === 'native') { if (inGesture || _fsActivationNow()) _tryFullscreen(true); else _FS.pending = true; }
+    return m;
+  },
+};
+/** What the page runs on, read once at boot; all false when HEADLESS (or when anything throws).
+ *  iPhone/iPod browsers have NO element Fullscreen API (Safari and every other iOS browser are WebKit): the only true fullscreen
+ *  there is a Home Screen web app. iPadOS has the API (webkit-prefixed before 16.4) and asks for desktop sites by default, so an
+ *  iPad may say "Macintosh": platform MacIntel + touch points gives it away. */
+const PLATFORM = (() => {
+  const p = { iphone: false, ipad: false, ios: false, standalone: false, framed: false, webview: false, safari: 0 };
+  if (HEADLESS) return p;
+  try {
+    const nav = navigator, ua = String(nav.userAgent || ''), macTouch = nav.platform === 'MacIntel' && nav.maxTouchPoints > 1;
+    p.iphone = /iPhone|iPod/.test(ua) || (macTouch && _phone(9999));        // (an iPhone asking for desktop sites says Mac too)
+    p.ipad = !p.iphone && (/iPad/.test(ua) || macTouch);
+    p.ios = p.iphone || p.ipad;
+    let app = false; // iOS reports a manifest "standalone" app as display-mode FULLSCREEN (WebKit 264218): ask for all three
+    try { app = typeof matchMedia === 'function' && matchMedia('(display-mode: standalone), (display-mode: fullscreen), (display-mode: minimal-ui)').matches; } catch (e) { /* old browser */ }
+    p.standalone = nav.standalone === true || app;
+    try { p.framed = window.self !== window.top || !!window.claude; } catch (e) { p.framed = true; } // an iframe / the claude.ai viewer
+    p.webview = p.ios && !/Safari\//.test(ua);                 // an app's own WKWebView: no Share > Add to Home Screen in there
+    const v = /Version\/(\d+)/.exec(ua);                         // Safari's version (iOS 26 froze the OS token at 18_x)
+    p.safari = p.ios && v && !/CriOS|FxiOS|EdgiOS|OPiOS|GSA\//.test(ua) ? +v[1] : 0;
+  } catch (e) { /* keep the defaults */ }
+  return p;
+})();
+/** a PHONE, by the screen's short side (iOS keeps screen.* in portrait values; an iPad in Split View is narrow too, but turning
+ *  it doesn't help) — falls back to the window width when the screen size is unknown */
+function _phone(vw) { try { const s = Math.min(screen.width || 0, screen.height || 0); if (s > 0) return s < 600; } catch (e) { /* ignore */ } return vw < 600; }
+/** CSS px of height the browser's own bars take right now (Safari's toolbar: the screen minus the viewport) */
+function _barH(vw, vh) {
+  try { const a = screen.width || 0, b = screen.height || 0; if (!a || !b) return 0; return Math.max(0, Math.round((vw > vh ? Math.min(a, b) : Math.max(a, b)) - vh)); } catch (e) { return 0; }
+}
 function setupDisplay() {
   const d = DISPLAY;
   d.canvas = document.getElementById('screen') || document.body.appendChild(document.createElement('canvas'));
@@ -1784,10 +1831,11 @@ function setupDisplay() {
     let padT = 0, padB = 0, padL = 0, padR = 0; // keep clear of phone safe-area insets (notch: top in portrait, a side in landscape)
     try { const cs = getComputedStyle(document.documentElement); padT = parseFloat(cs.paddingTop) || 0; padB = parseFloat(cs.paddingBottom) || 0; padL = parseFloat(cs.paddingLeft) || 0; padR = parseFloat(cs.paddingRight) || 0; } catch (e) { /* ignore */ }
     const vv = window.visualViewport, vw = vv ? vv.width : window.innerWidth, vh = vv ? vv.height : window.innerHeight;
-    const portrait = IN.touchDevice && vh > vw * 1.15 && vw < 600;          // a phone held upright (tablets are big enough)
+    const portrait = IN.touchDevice && _phone(vw) && vh > vw * 1.15;     // a phone held upright (tablets are big enough)
     if (!portrait) d.rot = false;                                         // really turned sideways: no rotation needed
     const rot = portrait && !!d.rot;                                      // play-sideways mode for rotation-locked phones
-    const hintH = portrait ? (rot ? 30 : 52) : 0;                         // CSS px kept free for the caption
+    const fsBtn = portrait && !rot && _fsWantButton('upright', vw, vh);   // the FULL SCREEN button sits under the caption
+    const hintH = portrait ? (rot ? 30 : 52 + (fsBtn ? 48 : 0)) : 0;      // CSS px kept free for the caption (+ button)
     const availW = Math.max(W / d.dpr, vw - padL - padR), availH = Math.max(H / d.dpr, vh - padT - padB - hintH);
     const devW = Math.floor(availW * d.dpr), devH = Math.floor(availH * d.dpr), devT = Math.round(padT * d.dpr), devL = Math.round(padL * d.dpr);
     const s = Math.max(1, Math.floor(rot ? Math.min(devH / W, devW / H) : Math.min(devW / W, devH / H)));
@@ -1806,49 +1854,79 @@ function setupDisplay() {
     }
     d.canvas.style.left = boxL + 'px'; d.canvas.style.top = boxT + 'px';
     d.rotated = rot; d.ctx.imageSmoothingEnabled = false; d.dirty = true;
-    _layoutHint(d, portrait, rot, boxL, boxT + boxH, boxW, resize);
+    d.geo = { vw, vh, padT, padR, padB, padL, boxL, boxT, boxW, boxH, portrait, rot };
+    const cap = _layoutHint(d, portrait, rot, boxL, boxT + boxH, boxW, resize);
+    _layoutFs(d, cap); _fsCardLayout(); _swipeLayout(); _vpReadout(); _standaloneProbe(resize);
   };
   try { d.rot = localStorage.getItem('jj-rot') === '1'; } catch (e) { d.rot = false; }
   const later = () => { resize(); setTimeout(resize, 250); setTimeout(resize, 700); }; // iOS reports sizes late after rotating
   window.addEventListener('resize', resize); window.addEventListener('orientationchange', later);
   if (window.visualViewport) window.visualViewport.addEventListener('resize', resize);
-  document.addEventListener('fullscreenchange', later);
+  d.relayout = resize;
+  const fsChange = () => { _fsChanged(); later(); };
+  document.addEventListener('fullscreenchange', fsChange); document.addEventListener('webkitfullscreenchange', fsChange); // iPadOS < 16.4: prefixed only
+  // the help card is modal: while it shows, keys close it (Esc / Enter / Space) and never reach the game
+  window.addEventListener('keydown', e => {
+    if (!_fsCardShown()) return;
+    e.preventDefault(); e.stopPropagation();
+    if (!e.repeat && /^(Escape|Enter|NumpadEnter|Space|KeyE)$/.test(e.code)) _fsCardClose(false);
+  }, true);
   resize();
 }
-/** Portrait phones: a pixel-font "turn sideways" caption under the game (rendered with the game's own font + palette). */
+/** Copy an indexed canvas (canvas8 / sprite) into a DOM canvas's pixels (transparent -> VOID). */
+function _toDom(cv, el) {
+  el.width = cv.w; el.height = cv.h;
+  const cx = el.getContext('2d'), img = cx.createImageData(cv.w, cv.h), u = new Uint32Array(img.data.buffer);
+  for (let i = 0; i < cv.w * cv.h; i++) u[i] = PAL32[cv.d[i] === TRANSPARENT ? C.VOID : cv.d[i]];
+  cx.putImageData(img, 0, 0); return el;
+}
+/** One DOM element per role (data-jj="role", data-jjk="key"), replacing any copy an earlier run of this script left behind
+ *  (a viewer hot reload must never stack captions or buttons). */
+function _jjEl(tag, role, key) {
+  const sel = '[data-jj="' + role + '"]' + (key ? '[data-jjk="' + key + '"]' : '');
+  try { const old = document.querySelectorAll(sel); for (let i = 0; i < old.length; i++) old[i].remove(); } catch (e) { /* ignore */ }
+  const el = document.createElement(tag); el.setAttribute('data-jj', role); if (key) el.setAttribute('data-jjk', key); return el;
+}
+/** Place a pixel element: (x, y, w, h) in CSS px of the PLAYER's frame. rot = the play-sideways mode, where the game's top faces
+ *  the screen's right: player (x, y) = screen (vw - y, x), and the element turns 90deg with the game. Snapped to device pixels. */
+function _place(el, x, y, w, h, rot, vw, dpr) {
+  const s = v => Math.round(v * dpr) / dpr;
+  el.style.width = w + 'px'; el.style.height = h + 'px';
+  if (rot) { el.style.left = s(vw - y - h) + 'px'; el.style.top = s(x) + 'px'; el.style.transformOrigin = '0 0'; el.style.transform = 'translateX(' + h + 'px) rotate(90deg)'; }
+  else { el.style.left = s(x) + 'px'; el.style.top = s(y) + 'px'; el.style.transformOrigin = ''; el.style.transform = ''; }
+  el.style.display = 'block';
+}
 /** Render a caption with the game's own font + palette into a DOM canvas (pixel-crisp, tappable). */
-function _captionCanvas(lines, phone) {
+function _captionCanvas(lines, phone, key) {
   let cw = 0; for (const l of lines) cw = Math.max(cw, textW(l, FONT_S)); cw += phone ? 22 : 8; const ch = 4 + lines.length * 8, cv = canvas8(cw, ch);
   pushTarget(); target(cv); cls(C.VOID);
   if (phone) { rrectb(1, 1, 9, 7, C.STEEL2); rect(2, 2, 7, 5, C.DUSK); pset(5, 4, C.GOLD2); rect(10, 4, 2, 1, C.PINK); pset(12, 3, C.PINK); pset(12, 5, C.PINK); }
   lines.forEach((l, i) => text(l, phone ? 18 : 4, 3 + i * 8, i ? C.PINKC : C.GOLD2, FONT_S));
   popTarget();
-  const el = document.createElement('canvas'); el.width = cw; el.height = ch;
-  const cx = el.getContext('2d'), img = cx.createImageData(cw, ch), u = new Uint32Array(img.data.buffer);
-  for (let i = 0; i < cw * ch; i++) u[i] = PAL32[cv.d[i] === TRANSPARENT ? C.VOID : cv.d[i]];
-  cx.putImageData(img, 0, 0);
+  const el = _toDom(cv, _jjEl('canvas', 'hint', key));
   el.style.cssText = 'position:absolute;display:none;image-rendering:pixelated;image-rendering:crisp-edges;touch-action:manipulation;cursor:pointer';
   el.setAttribute('role', 'button');
   document.body.appendChild(el); return el;
 }
 /** Portrait phones: "turn sideways" caption under the game; tapping it (rotation lock on?) turns the game 90deg to fill the
- *  screen — and a second caption turns it back. The choice is remembered. */
+ *  screen — and a second caption turns it back. The choice is remembered. Returns {bottom, k} of the shown caption (or null). */
 function _layoutHint(d, show, rot, left, top, width, relayout) {
   try {
     if (!d.hintA) {
-      if (!show) return;
+      if (!show) return null;
       const toggle = e => { if (e) e.preventDefault(); d.rot = !d.rot; try { localStorage.setItem('jj-rot', d.rot ? '1' : '0'); } catch (x) { /* blocked */ } relayout(); AUDIO.unlock(); };
-      d.hintA = _captionCanvas(['TURN SIDEWAYS FOR THE BIG TABLE', 'ROTATION LOCKED? TAP HERE'], true);
-      d.hintB = _captionCanvas(['TAP HERE TO TURN IT BACK'], false);
+      d.hintA = _captionCanvas(['TURN SIDEWAYS FOR THE BIG TABLE', 'ROTATION LOCKED? TAP HERE'], true, 'a');
+      d.hintB = _captionCanvas(['TAP HERE TO TURN IT BACK'], false, 'b');
       d.hintA.setAttribute('aria-label', 'Rotation locked? Tap to turn the game sideways'); d.hintB.setAttribute('aria-label', 'Turn the game back upright');
       for (const el of [d.hintA, d.hintB]) { el.addEventListener('touchend', toggle, { passive: false }); el.addEventListener('click', toggle); }
     }
     const el = rot ? d.hintB : d.hintA, other = rot ? d.hintA : d.hintB;
-    other.style.display = 'none'; el.style.display = show ? 'block' : 'none'; if (!show) return;
+    other.style.display = 'none'; el.style.display = show ? 'block' : 'none'; if (!show) return null;
     const k = Math.max(1, Math.floor(Math.min(width / el.width, 3)));
     el.style.width = (el.width * k) + 'px'; el.style.height = (el.height * k) + 'px';
     el.style.left = Math.round(left + (width - el.width * k) / 2) + 'px'; el.style.top = Math.round(top + 10) + 'px';
-  } catch (e) { /* cosmetic only */ }
+    return { bottom: Math.round(top + 10) + el.height * k, k };
+  } catch (e) { return null; /* cosmetic only */ }
 }
 /** Keep the screen awake while the page is visible (long cutscenes have no touches). Asked after a user gesture. */
 const _WL = { lock: null, asked: false };
@@ -1859,17 +1937,381 @@ function _wakeLock() {
     navigator.wakeLock.request('screen').then(l => { _WL.lock = l; l.addEventListener('release', () => { _WL.lock = null; }); }).catch(() => { _WL.lock = null; });
   } catch (e) { _WL.lock = null; }
 }
-/** Android/desktop: the first tap on a touch device asks for fullscreen + landscape (silently ignored where unsupported,
- *  e.g. iPhone Safari or inside an iframe). */
-let _FS_TRIES = 0;
-function _tryFullscreen() {
+
+// ------------------------------------------------------------------ full screen (Android / iPad: the API; iPhone: Home Screen)
+const _FS = { tries: 0, on: false, ever: false, dud: false, pending: false, seen: false, btn: null, cap: null, card: null, cardCv: null, cardT: 0, cardKey: '', cardArt: null, cardArtFor: 0, vp: null, probe: 0 };
+function _fsElement() { try { return document.fullscreenElement || document.webkitFullscreenElement || null; } catch (e) { return null; } }
+function _fsActivationNow() { try { const u = navigator.userActivation; return !!(u && u.isActive); } catch (e) { return false; } }
+function _fsMode() {
+  if (HEADLESS || !IN.touchDevice || PLATFORM.framed) return 'none';
+  if (PLATFORM.standalone || _fsElement()) return 'on';
+  let api = false; try { const el = document.documentElement; api = !!(el.requestFullscreen || el.webkitRequestFullscreen) && !_FS.dud; } catch (e) { /* ignore */ }
+  return api ? 'native' : PLATFORM.ios ? 'ios-home' : 'none';
+}
+/** iPhone only: the API is expected to be missing there. If a call exists but fullscreen doesn't follow (a beta flag, a broken
+ *  build), stop believing in it — the Add to Home Screen card takes over. Android / iPad keep their old behaviour. */
+function _fsDud() {
+  if (!PLATFORM.iphone || _fsElement() || _FS.dud) return;
+  _FS.dud = true; try { if (DISPLAY.relayout) DISPLAY.relayout(); } catch (e) { /* ignore */ } _fsAutoHelp();
+}
+/** The first tap on a touch device asks for fullscreen + landscape (Android, iPad, touch laptops; never inside an iframe).
+ *  touchEND is the user activation (iOS + Chrome). iPadOS 12-16.3 only has the prefixed call, which returns nothing:
+ *  webkitfullscreenchange reports success. Once it worked it never asks again by itself (leaving is the player's choice);
+ *  force = the FULL SCREEN button / DISPLAY.fullscreen(). iPhone: no API at all — the card explains Add to Home Screen. */
+function _tryFullscreen(force) {
   try {
-    if (!IN.touchDevice || window.self !== window.top || document.fullscreenElement || _FS_TRIES >= 3) return;
-    const el = document.documentElement; if (!el.requestFullscreen) return;
-    _FS_TRIES++;
-    const p = el.requestFullscreen({ navigationUI: 'hide' });
-    if (p && p.then) p.then(() => { _FS_TRIES = 99; try { const o = screen.orientation; if (o && o.lock) o.lock('landscape').catch(() => {}); } catch (e) { /* ignore */ } }).catch(() => {});
+    // an iOS Home Screen app is already full screen: element fullscreen there only adds iPadOS's X / swipe-down way OUT
+    if (!IN.touchDevice || PLATFORM.framed || _fsElement() || (PLATFORM.ios && PLATFORM.standalone)) return;
+    if (force) _FS.tries = 0;
+    if (_FS.tries >= 3) return;
+    const el = document.documentElement;
+    if (el.requestFullscreen) { _FS.tries++; const p = el.requestFullscreen({ navigationUI: 'hide' }); if (p && p.then) p.then(_fsEntered).catch(_fsDud); else setTimeout(_fsDud, 1200); }
+    else if (el.webkitRequestFullscreen) { _FS.tries++; el.webkitRequestFullscreen(typeof Element !== 'undefined' ? Element.ALLOW_KEYBOARD_INPUT : undefined); setTimeout(_fsDud, 1200); }
   } catch (e) { /* ignore */ }
+}
+function _fsEntered() {
+  if (_FS.on) return; _FS.on = true; _FS.tries = 99; _FS.ever = true; _FS.dud = false;
+  try { const o = screen.orientation; if (o && o.lock) o.lock('landscape').catch(() => {}); } catch (e) { /* iOS: no lock */ }
+}
+function _fsChanged() { if (_fsElement()) _fsEntered(); else _FS.on = false; }
+/** From the trusted input handlers (touchEND, keydown, mousedown): the first-tap request, a FULL SCREEN request a tick made
+ *  without an activation (DISPLAY.fullscreen), and (touchend) the one-time iPhone card. */
+function _fsActivation(touchEnd) {
+  if (_FS.pending) { _FS.pending = false; if (_fsMode() === 'native') _tryFullscreen(true); }
+  else if (touchEnd) _tryFullscreen();
+  if (touchEnd) _fsAutoHelp();
+}
+function _fsSeen(mark) {
+  if (mark) { _FS.seen = true; try { localStorage.setItem('jj-fshelp', '1'); } catch (e) { /* blocked: once per visit */ } return true; }
+  if (!_FS.seen) { try { _FS.seen = localStorage.getItem('jj-fshelp') === '1'; } catch (e) { /* blocked */ } }
+  return _FS.seen;
+}
+/** iPhone: once ever, the first time the player taps the game turned sideways (landscape, or the play-sideways mode) — on the
+ *  title or walking around, never mid-hand at a table or mid-conversation — explain the one true fullscreen. */
+function _fsAutoHelp() {
+  try {
+    if (_fsCardShown() || _fsMode() !== 'ios-home') return;
+    const g = DISPLAY.geo; if (!g || !(g.vw > g.vh || DISPLAY.rotated)) return;
+    if ((Scenes.id !== 'title' && Scenes.id !== 'world') || Overlays.stack.length) return;
+    if (_swipeOffer() || _SW.state) return; // EXPERIMENT (?fs=swipe): this visit tries hiding Safari's bars instead (card = its fallback)
+    if (!_fsSeen()) _fsCardOpen();
+  } catch (e) { /* cosmetic only */ }
+}
+/** Show the FULL SCREEN button? iPhone: upright always (under the caption), sideways only while Safari's bars eat height;
+ *  Android / iPad: only after fullscreen worked once and the player left it (the way back). */
+function _fsWantButton(kind, vw, vh, m) {
+  m = m || _fsMode();
+  if (m === 'native') return _FS.ever;
+  if (m !== 'ios-home') return false;
+  return kind !== 'wide' || _barH(vw, vh) > 8;
+}
+// --- pixel art for the button + card (the game's own fonts and palette)
+const _FS_ICON = {};
+function _fsIcons() {
+  if (_FS_ICON.share) return _FS_ICON;
+  _FS_ICON.share = sprite(`
+...c...
+..ccc..
+.c.c.c.
+...c...
+ss.c.ss
+s..c..s
+s.....s
+s.....s
+sssssss`, { c: 'CYAN', s: 'STEEL3' });                                            // iOS's Share: a box with an arrow out of it
+  _FS_ICON.full = sprite(`
+ccc.ccc
+c.....c
+c.....c
+.......
+c.....c
+c.....c
+ccc.ccc`, { c: 'CYAN' });                                                        // expand-to-fullscreen corners
+  return _FS_ICON;
+}
+const _FS_BTN_ART = {};
+/** The button: icon + FULL SCREEN, flat (under a caption / game) or stacked (a side letterbox). icon 'share' | 'full';
+ *  quiet = the player has seen the card already: steel instead of gold, still there but no longer calling for attention. */
+function _fsBtnArt(icon, stacked, quiet) {
+  const key = icon + (stacked ? 'V' : 'H') + (quiet ? 'q' : ''); if (_FS_BTN_ART[key]) return _FS_BTN_ART[key];
+  const I = _fsIcons()[icon], f = FONT_S, tc = quiet ? C.STEEL3 : C.GOLD2;
+  let cv;
+  if (!stacked) {
+    const tw = textW('FULL SCREEN', f), w = 4 + I.w + 4 + tw + 5, h = 13;
+    cv = canvas8(w, h); pushTarget(); target(cv);
+    rrect(0, 0, w, h, C.DUSK); rrectb(0, 0, w, h, C.STEEL2); hline(2, w - 3, 1, C.NIGHT);
+    blit(I, 4, (h - I.h) >> 1); text('FULL SCREEN', 4 + I.w + 4, 4, tc, f, C.INK);
+  } else {
+    const tw = Math.max(textW('FULL', f), textW('SCREEN', f)), w = tw + 8, h = 4 + I.h + 4 + 5 + 2 + 5 + 4;
+    cv = canvas8(w, h); pushTarget(); target(cv);
+    rrect(0, 0, w, h, C.DUSK); rrectb(0, 0, w, h, C.STEEL2); hline(2, w - 3, 1, C.NIGHT);
+    blit(I, (w - I.w) >> 1, 4); const ty = 4 + I.h + 4;
+    text('FULL', w >> 1, ty, tc, f, C.INK, 1, 1); text('SCREEN', w >> 1, ty + 7, tc, f, C.INK, 1, 1);
+  }
+  popTarget();
+  return (_FS_BTN_ART[key] = cv);
+}
+function _fsButton() {
+  if (_FS.btn && _FS.btn.isConnected) return _FS.btn;
+  const el = _jjEl('canvas', 'fs');
+  el.style.cssText = 'position:absolute;display:none;z-index:2;image-rendering:pixelated;image-rendering:crisp-edges;touch-action:none;cursor:pointer';
+  el.setAttribute('role', 'button'); el.setAttribute('aria-label', 'Play full screen');
+  const go = e => { if (e) { if (e.cancelable) e.preventDefault(); e.stopPropagation(); } try { AUDIO.unlock(); } catch (x) { /* ignore */ } DISPLAY.fullscreen(true); };
+  let x0 = 0, y0 = 0; // a thumb sliding off the letterbox is not a tap
+  el.addEventListener('touchstart', e => { const t = e.changedTouches[0]; x0 = t.clientX; y0 = t.clientY; if (e.cancelable) e.preventDefault(); e.stopPropagation(); }, { passive: false }); // no synthetic mouse events
+  el.addEventListener('touchend', e => { const t = e.changedTouches[0]; if (Math.abs(t.clientX - x0) + Math.abs(t.clientY - y0) < 24) go(e); else if (e.cancelable) e.preventDefault(); }, { passive: false });
+  el.addEventListener('click', go);
+  document.body.appendChild(el); _FS.btn = el; el._art = null; return el;
+}
+/** The FULL SCREEN button goes wherever there is room OUTSIDE the game image: under the turn-sideways caption (upright), else a
+ *  side letterbox aligned with the HUD (stacked; play-sideways: the player's left, turned with the game), else under/over the
+ *  game. Never over the picture; hidden when nothing fits. */
+function _layoutFs(d, cap) {
+  try {
+    const g = d.geo; if (!g) return; _FS.cap = cap;
+    const kind = g.portrait ? (g.rot ? 'rot' : 'upright') : 'wide', m = _fsMode();
+    if (!_fsWantButton(kind, g.vw, g.vh, m)) { if (_FS.btn) _FS.btn.style.display = 'none'; return; }
+    const btn = _fsButton(), dpr = d.dpr || 1, icon = m === 'native' ? 'full' : 'share', quiet = m === 'ios-home' && _fsSeen();
+    const kMin = Math.max(1, Math.round(1.34 * dpr)), kMax = Math.max(kMin, Math.round(2 * dpr)); // device px per art px
+    let pick = null;
+    if (kind === 'upright') {
+      const a = _fsBtnArt(icon, false, quiet), k = Math.max(kMin, Math.round(((cap && cap.k) || 2) * dpr)), w = a.w * k / dpr, h = a.h * k / dpr;
+      const top = cap ? cap.bottom + 8 : g.boxT + g.boxH + 10;
+      if (top + h <= g.vh - g.padB - 2) pick = { a, x: g.boxL + (g.boxW - w) / 2, y: top, w, h, rot: false };
+    } else {
+      const rot = kind === 'rot'; // the player's frame: game box + safe areas as the player sees them
+      const F = rot ? { W: g.vh, H: g.vw, gx: g.boxT, gy: g.vw - g.boxL - g.boxW, gw: g.boxH, gh: g.boxW, l: g.padT, t: g.padR, r: g.padB, b: g.padL }
+        : { W: g.vw, H: g.vh, gx: g.boxL, gy: g.boxT, gw: g.boxW, gh: g.boxH, l: g.padL, t: g.padT, r: g.padR, b: g.padB };
+      const L = F.gx - F.l, R = rot ? 0 : F.W - F.r - F.gx - F.gw; // play-sideways: the player's right holds the turn-back caption
+      const side = L >= R ? { x: F.l, w: L } : { x: F.gx + F.gw, w: R };
+      const av = _fsBtnArt(icon, true, quiet), kv = Math.min(kMax, Math.floor((side.w - 8) * dpr / av.w));
+      if (kv >= kMin) { const w = av.w * kv / dpr, h = av.h * kv / dpr; pick = { a: av, x: side.x + (side.w - w) / 2, y: F.gy + 2, w, h, rot }; }
+      else {
+        const ah = _fsBtnArt(icon, false, quiet), below = F.H - F.b - F.gy - F.gh, above = F.gy - F.t, room = Math.max(below, above);
+        const kh = Math.min(kMax, Math.floor((room - 6) * dpr / ah.h), Math.floor(F.gw * dpr / ah.w));
+        if (kh >= kMin) { const w = ah.w * kh / dpr, h = ah.h * kh / dpr; pick = { a: ah, x: F.gx + (F.gw - w) / 2, y: below >= above ? F.gy + F.gh + (below - h) / 2 : F.t + (above - h) / 2, w, h, rot }; }
+      }
+    }
+    if (!pick) { btn.style.display = 'none'; return; }
+    if (btn._art !== pick.a) { _toDom(pick.a, btn); btn._art = pick.a; }
+    btn.setAttribute('aria-label', m === 'native' ? 'Play full screen' : 'Play full screen: how to add the game to your Home Screen');
+    _place(btn, pick.x, pick.y, pick.w, pick.h, pick.rot, g.vw, dpr);
+  } catch (e) { /* cosmetic only */ }
+}
+/** The card's words, per browser. Rows: title / p / step (numbered) / note / foot; {y} colour codes, @icons. */
+function _fsCardRows() {
+  const P = PLATFORM, R = [{ k: 'title', s: '★ PLAY FULL SCREEN ★' }];
+  if (P.webview) {
+    R.push({ k: 'p', s: "This app's own browser can't do it." });
+    R.push({ k: 'step', n: '1', s: 'Open this page in {y}Safari{/}' });
+    R.push({ k: 'step', n: '2', s: 'Tap @share {y}Share{/} > {y}Add to Home Screen{/}' });
+    R.push({ k: 'step', n: '3', s: 'Open {y}Jackalope{/} from your Home Screen' });
+  } else {
+    R.push({ k: 'p', s: (P.safari ? 'Safari' : 'This browser') + " won't, but your Home Screen will:" });
+    R.push({ k: 'step', n: '1', s: P.safari >= 26 ? 'Tap ••• then @share {y}Share{/}' : 'Tap @share {y}Share{/}' });
+    R.push({ k: 'step', n: '2', s: 'Choose {y}Add to Home Screen{/} (scroll down)' });
+    R.push({ k: 'step', n: '3', s: 'Open {y}Jackalope{/} from your Home Screen' });
+    R.push({ k: 'note', s: P.safari ? 'Quick fix here: {y}aA{/} / page menu > {y}Hide Toolbar{/}' : 'Not in the list? Open this page in Safari first.' });
+  }
+  R.push({ k: 'note', s: 'The Home Screen copy keeps its own saves.' });
+  R.push({ k: 'foot', s: 'TAP ANYWHERE TO PLAY ON' });
+  return R;
+}
+/** Word-wrap the rows into positioned pieces (words with {y} colour codes, @icons; steps get a numbered badge and a hanging
+ *  indent; title + foot centred) for an inner width iw. Returns {P: pieces, h}. */
+function _fsLayRows(rows, iw) {
+  const I = _fsIcons(), P = []; let y = 0, prev = '', maxW = 0;
+  const GAP = { p: 5, step: 3, note: 5, foot: 7 };
+  for (const row of rows) {
+    const f = row.k === 'foot' ? FONT_S : FONT_M, lh = row.k === 'foot' ? 6 : 10, sp = f.map.get(32).w + f.sp;
+    const base = row.k === 'note' ? C.STEEL3 : row.k === 'title' || row.k === 'foot' ? C.GOLD2 : C.WHITE;
+    const ind = row.k === 'step' ? 13 : 0, avail = iw - ind, centre = row.k === 'title' || row.k === 'foot';
+    if (prev) y += row.k === 'note' && prev === 'note' ? 2 : (GAP[row.k] || 4);
+    if (row.k === 'step') P.push({ b: row.n, x: 0, y });
+    let col = base, line = [], lw = 0;
+    const flush = () => { const ox = centre ? Math.floor((iw - lw) / 2) : ind; maxW = Math.max(maxW, ind + lw); for (const q of line) { q.x += ox; q.y = y; P.push(q); } line = []; lw = 0; y += lh; };
+    for (const tok of row.s.split(' ')) {
+      if (!tok) continue;
+      const atoms = []; let tw = 0;
+      if (tok[0] === '@' && I[tok.slice(1)]) { atoms.push({ ic: I[tok.slice(1)], dx: 0 }); tw = I[tok.slice(1)].w; }
+      else for (const part of tok.split(/(\{.\})/)) {
+        if (!part) continue;
+        const m = /^\{(.)\}$/.exec(part); if (m) { col = m[1] === '/' ? base : (TEXT_CODES[m[1]] !== undefined ? TEXT_CODES[m[1]] : base); continue; }
+        const dx = atoms.length ? tw + f.sp : 0; atoms.push({ s: part, c: col, dx }); tw = dx + textW(part, f);
+      }
+      if (!atoms.length) continue;
+      if (line.length && lw + sp + tw > avail) flush();
+      const x0 = line.length ? lw + sp : 0;
+      for (const at of atoms) line.push({ s: at.s, ic: at.ic, c: at.c, f, x: x0 + at.dx, y: 0 });
+      lw = x0 + tw;
+    }
+    if (line.length) flush();
+    prev = row.k;
+  }
+  return { P, h: y, w: maxW };
+}
+function _fsDrawRows(lay, ox, oy) {
+  for (const q of lay.P) {
+    if (q.b) { rrect(ox + q.x, oy + q.y - 1, 9, 9, C.GOLD); text(q.b, ox + q.x + 5, oy + q.y, C.INK, FONT_M, -1, 1, 1); continue; }
+    if (q.ic) { blit(q.ic, ox + q.x, oy + q.y + ((q.f === FONT_S ? 5 : 7) - q.ic.h >> 1)); continue; }
+    text(q.s, ox + q.x, oy + q.y, q.c, q.f, q.f === FONT_M ? C.INK : -1);
+  }
+}
+/** The card art for a wrap width of at most cw (cached per cw), shrunk to its longest line: the game's gold art-deco panel. */
+function _fsCardArt(cw) {
+  if (_FS.cardArt && _FS.cardArtFor === cw) return _FS.cardArt;
+  const M = 8, rows = _fsCardRows(); let lay = _fsLayRows(rows, cw - M * 2);
+  if (lay.w < cw - M * 2) lay = _fsLayRows(rows, lay.w);       // same line breaks, title + foot centred on the real width
+  const w = lay.w + M * 2, ch = lay.h + M * 2 - 2, cv = canvas8(w, ch);
+  pushTarget(); target(cv); cls(C.VOID); UI.panel(0, 0, w, ch, 'deco'); _fsDrawRows(lay, M, M); popTarget();
+  _FS.cardArtFor = cw; return (_FS.cardArt = cv);
+}
+function _fsCardShown() { return !!(_FS.card && _FS.card.isConnected && _FS.card.style.display !== 'none'); }
+/** The Add to Home Screen card (modal, pixel art, turned with the game in play-sideways mode). Taps never reach the game. */
+function _fsCardOpen() {
+  try {
+    if (!_FS.card || !_FS.card.isConnected) {
+      const back = _jjEl('div', 'fscard'), cv = document.createElement('canvas');
+      back.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:20;display:none;background:rgba(6,5,10,0.82);touch-action:none;cursor:pointer;-webkit-user-select:none;user-select:none';
+      cv.style.cssText = 'position:absolute;image-rendering:pixelated;image-rendering:crisp-edges';
+      back.setAttribute('role', 'dialog'); back.setAttribute('aria-modal', 'true');
+      back.appendChild(cv);
+      const stop = e => { if (e.cancelable) e.preventDefault(); e.stopPropagation(); };
+      const close = e => { stop(e); _fsCardClose(true); };
+      back.addEventListener('touchstart', stop, { passive: false }); back.addEventListener('touchmove', stop, { passive: false });
+      back.addEventListener('touchend', close, { passive: false }); back.addEventListener('click', close);
+      back.addEventListener('mousedown', e => e.stopPropagation());
+      document.body.appendChild(back); _FS.card = back; _FS.cardCv = cv; _FS.cardKey = '';
+    }
+    _fsSeen(true); _FS.cardT = performance.now(); _FS.cardArt = null; _FS.cardKey = '';
+    _FS.card.setAttribute('aria-label', _fsCardRows().map(r => r.s.replace(/\{.\}/g, '').replace(/@share/g, 'Share').replace(/•••/g, 'the three-dot button').replace(/★/g, '')).join('. '));
+    _FS.card.style.display = 'block'; _fsCardLayout();
+  } catch (e) { /* cosmetic only */ }
+}
+/** tap = true: ignore a tap in the first 0.65 s (a quick double tap on the game must not dismiss it unread) */
+function _fsCardClose(tap) {
+  try {
+    if (!_fsCardShown() || (tap && performance.now() - _FS.cardT < 650)) return;
+    _FS.card.style.display = 'none'; _layoutFs(DISPLAY, _FS.cap); AUDIO.unlock();      // (the button turns quiet)
+  } catch (e) { /* ignore */ }
+}
+/** Size + place the open card: the biggest whole-device-pixel scale (at most 3 CSS px per pixel) whose word-wrapped card fits
+ *  94% of the safe area of the player's frame (play-sideways: turned 90deg like the game). */
+function _fsCardLayout() {
+  try {
+    if (!_fsCardShown()) return;
+    const d = DISPLAY, g = d.geo, dpr = d.dpr || 1, rot = !!d.rotated; if (!g) return;
+    const FW = rot ? g.vh - g.padT - g.padB : g.vw - g.padL - g.padR, FH = rot ? g.vw - g.padL - g.padR : g.vh - g.padT - g.padB;
+    let k = 1, art = null;
+    for (let kk = Math.max(1, Math.round(3 * dpr)); kk >= 1; kk--) {
+      const cw = Math.min(260, Math.floor(FW * 0.94 * dpr / kk));
+      if (cw < 150 && kk > 1) continue;
+      art = _fsCardArt(Math.max(120, cw)); k = kk;
+      if (art.h * kk <= FH * 0.94 * dpr) break;
+    }
+    const cv = _FS.cardCv, key = art.w + 'x' + art.h;
+    if (_FS.cardKey !== key) { _toDom(art, cv); _FS.cardKey = key; }
+    const w = art.w * k / dpr, h = art.h * k / dpr;
+    _place(cv, (rot ? g.padT : g.padL) + (FW - w) / 2, (rot ? g.padR : g.padT) + (FH - h) / 2, w, h, rot, g.vw, dpr);
+  } catch (e) { /* cosmetic only */ }
+}
+/** ?vp=1 — an on-device readout of the numbers behind the layout (viewport, screen, safe areas, Safari's bar, scale, mode):
+ *  a screenshot from a real phone settles what emulation can only estimate. Off by default. */
+function _vpReadout() {
+  try {
+    if (param('vp', '0') !== '1') return;
+    const d = DISPLAY, g = d.geo, P = PLATFORM, vv = window.visualViewport, r = Math.round; if (!g) return;
+    const lines = [
+      'IN ' + innerWidth + 'X' + innerHeight + ' VV ' + (vv ? r(vv.width) + 'X' + r(vv.height) + ' Z' + (+vv.scale).toFixed(2) : '-') + ' SCR ' + screen.width + 'X' + screen.height + ' DPR ' + d.dpr,
+      'PAD ' + [g.padT, g.padR, g.padB, g.padL].map(r).join('/') + ' BAR ' + _barH(g.vw, g.vh) + ' SCALE ' + d.scale + (d.rotated ? ' ROT' : '') + ' FS ' + _fsMode(),
+      (P.iphone ? 'IPHONE' : P.ipad ? 'IPAD' : 'OTHER') + ' SAFARI ' + P.safari + (P.standalone ? ' STANDALONE' : '') + (P.webview ? ' WEBVIEW' : '') + (P.framed ? ' FRAMED' : '') + ' TOUCH ' + (IN.touchDevice ? 1 : 0) + ' H' + (document.documentElement.style.height || '-'),
+    ];
+    let cw = 0; for (const l of lines) cw = Math.max(cw, textW(l, FONT_S)); cw += 4; const ch = lines.length * 6 + 3, cv = canvas8(cw, ch);
+    pushTarget(); target(cv); cls(C.INK); lines.forEach((l, i) => text(l, 2, 2 + i * 6, i === 1 ? C.GOLD2 : C.GREEN, FONT_S)); popTarget();
+    let el = _FS.vp && _FS.vp.isConnected ? _FS.vp : null;
+    if (!el) { el = _FS.vp = _jjEl('canvas', 'vp'); el.style.cssText = 'position:absolute;z-index:30;pointer-events:none;image-rendering:pixelated;image-rendering:crisp-edges'; document.body.appendChild(el); }
+    _toDom(cv, el);
+    const k = Math.max(1, Math.min(Math.round(2 * d.dpr), Math.floor((g.vw - g.padL - g.padR - 4) * d.dpr / cw)));
+    _place(el, g.padL + 2, g.vh - g.padB - 2 - ch * k / d.dpr, cw * k / d.dpr, ch * k / d.dpr, false, g.vw, d.dpr); // bottom left
+  } catch (e) { /* diagnostics only */ }
+}
+/** iOS 26 Home Screen apps were reported to size the page to the screen MINUS the status bar when nothing sits in the page flow
+ *  (true here: the canvas is absolutely positioned), leaving a dead band at the bottom; html{height:100vh} was the reported fix.
+ *  Self-checking: tried only when a standalone portrait viewport really is short, and kept only if it grows the viewport. */
+function _standaloneProbe(relayout) {
+  try {
+    if (!PLATFORM.ios || !PLATFORM.standalone || _FS.probe) return;
+    const sh = Math.max(screen.width || 0, screen.height || 0), h0 = window.innerHeight;
+    if (!(h0 > window.innerWidth) || !sh || h0 >= sh - 2) return;
+    _FS.probe = 1; const html = document.documentElement; html.style.height = '100vh';
+    setTimeout(() => { try { if (window.innerHeight <= h0) html.style.height = ''; else html.setAttribute('data-jj-vh', '1'); relayout(); } catch (e) { /* ignore */ } }, 400);
+  } catch (e) { /* ignore */ }
+}
+// --- EXPERIMENT, opt-in with ?fs=swipe: swipe up to hide Safari's bars (iPhone, landscape)
+/** iPhone Safari collapses its toolbar only when the PAGE scrolls, and this page never scrolls (touch-action none, overflow
+ *  hidden). Until it has been tried on real iOS 18 / 26 iPhones this is opt-in: the first sideways tap (title or world, bars
+ *  eating height) makes the page briefly scrollable under a SWIPE UP overlay (everything goes position:fixed, a spacer makes
+ *  room); once the viewport has grown (bars gone) scrolling is locked again — Safari 26.4+ was reported to keep them down then,
+ *  iOS 18 may bring them back on a swipe down. Self-checking: two swipes that don't collapse the bars give up and show the Add
+ *  to Home Screen card instead; a tap = play as is; turning upright undoes it all. Once per page load. */
+const _SW = { state: '', el: null, cv: null, art: null, spacer: null, x0: 0, y0: 0, moved: 0, fails: 0, timer: 0 };
+function _swipeOffer() {
+  try {
+    if (_SW.state || param('fs', '') !== 'swipe' || !PLATFORM.iphone || !PLATFORM.safari || _fsMode() !== 'ios-home') return false;
+    const g = DISPLAY.geo; if (!g || g.portrait || !(g.vw > g.vh) || _barH(g.vw, g.vh) <= 8) return false;
+    _SW.state = 'offer'; _SW.fails = 0;
+    const html = document.documentElement, sp = _SW.spacer = _jjEl('div', 'swipe-spacer');
+    sp.style.cssText = 'position:absolute;left:0;top:0;width:1px;height:calc(100% + 600px);visibility:hidden;pointer-events:none';
+    const ov = _SW.el = _jjEl('div', 'swipe'), cv = _SW.cv = document.createElement('canvas');
+    ov.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;z-index:15;background:rgba(6,5,10,0.6);touch-action:pan-y;-webkit-user-select:none;user-select:none';
+    cv.style.cssText = 'position:absolute;pointer-events:none;image-rendering:pixelated;image-rendering:crisp-edges';
+    ov.setAttribute('role', 'dialog'); ov.setAttribute('aria-label', 'Swipe up for full screen, or tap to play as is'); ov.appendChild(cv);
+    ov.addEventListener('touchstart', e => { const t = e.changedTouches[0]; _SW.x0 = t.clientX; _SW.y0 = t.clientY; _SW.moved = 0; e.stopPropagation(); }, { passive: true });
+    ov.addEventListener('touchmove', e => { const t = e.changedTouches[0]; _SW.moved = Math.max(_SW.moved, Math.abs(t.clientX - _SW.x0) + Math.abs(t.clientY - _SW.y0)); }, { passive: true });
+    ov.addEventListener('touchend', e => {
+      e.stopPropagation();
+      if (_SW.moved < 12) { if (e.cancelable) e.preventDefault(); _swipeExit(); return; } // a tap: play as is
+      clearTimeout(_SW.timer); _SW.timer = setTimeout(_swipeCheck, 700);                  // Safari animates its bars away
+    }, { passive: false });
+    ov.addEventListener('click', e => { e.preventDefault(); e.stopPropagation(); _swipeExit(); });
+    ov.addEventListener('mousedown', e => e.stopPropagation());
+    document.body.appendChild(sp); document.body.appendChild(ov);
+    html.classList.add('jj-swipe-fixed', 'jj-swipe-scroll');
+    _swipeLayout(); return true;
+  } catch (e) { _swipeExit(); return false; }
+}
+function _swipeCheck() {
+  const g = DISPLAY.geo; if (_SW.state !== 'offer' || !g) return;
+  if (_barH(g.vw, g.vh) <= 8) _swipeLock();
+  else if (++_SW.fails >= 2) { _swipeExit(); _fsCardOpen(); } // Safari kept its bars: explain the Home Screen instead
+}
+/** Bars gone: lock scrolling again. The offset + spacer stay (scrolling back to the top would bring the bars back). */
+function _swipeLock() { _SW.state = 'locked'; document.documentElement.classList.remove('jj-swipe-scroll'); if (_SW.el) { _SW.el.remove(); _SW.el = null; } }
+/** Undo everything: the page exactly as before. */
+function _swipeExit() {
+  try {
+    clearTimeout(_SW.timer); if (_SW.state && _SW.state !== 'off') { try { window.scrollTo(0, 0); } catch (e) { /* ignore */ } }
+    document.documentElement.classList.remove('jj-swipe-scroll', 'jj-swipe-fixed');
+    if (_SW.el) { _SW.el.remove(); _SW.el = null; } if (_SW.spacer) { _SW.spacer.remove(); _SW.spacer = null; }
+  } catch (e) { /* ignore */ }
+  _SW.state = 'off';
+}
+/** From resize(): bars gone -> lock; turned upright -> undo; else centre the SWIPE UP caption. */
+function _swipeLayout() {
+  try {
+    if (_SW.state !== 'offer' && _SW.state !== 'locked') return;
+    const d = DISPLAY, g = d.geo, dpr = d.dpr || 1; if (!g) return;
+    if (g.portrait || !(g.vw > g.vh)) { _swipeExit(); return; }
+    if (_SW.state !== 'offer') return;
+    if (_barH(g.vw, g.vh) <= 8) { _swipeLock(); return; }
+    if (!_SW.art) {
+      const t1 = '▲ SWIPE UP FOR FULL SCREEN ▲', t2 = 'OR TAP TO PLAY AS IS', w = Math.max(textW(t1, FONT_M), textW(t2, FONT_S)) + 16, h = 30, cv = canvas8(w, h);
+      pushTarget(); target(cv); cls(C.VOID); UI.panel(0, 0, w, h, 'deco'); text(t1, w >> 1, 7, C.GOLD2, FONT_M, C.INK, 1, 1); text(t2, w >> 1, 19, C.STEEL3, FONT_S, -1, 1, 1); popTarget();
+      _SW.art = cv; _toDom(cv, _SW.cv);
+    }
+    const a = _SW.art, k = Math.max(1, Math.min(Math.round(3 * dpr), Math.floor((g.vw - g.padL - g.padR) * 0.9 * dpr / a.w))), w = a.w * k / dpr, h = a.h * k / dpr;
+    _place(_SW.cv, (g.vw - w) / 2, (g.vh - h) / 2, w, h, false, g.vw, dpr);
+  } catch (e) { /* cosmetic only */ }
 }
 function present() {
   const d = DISPLAY, u = d.u32;
